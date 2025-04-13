@@ -1,7 +1,8 @@
 import asyncio
 import random
 import os
-import aiohttp  # Added for download_song
+import aiohttp
+import logging
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -18,15 +19,21 @@ from youtubesearchpython import VideosSearch
 from config import HNDLR, bot, call_py
 from MusicUserbot.helpers.queues import QUEUE, add_to_queue, get_queue
 
+# Replace with your actual API credentials in config
 from config import API_KEY, API_URL
+
+# Configure logging
+logging.basicConfig(level=logging.ERROR)
 
 ROCKSPHOTO = [
     "https://telegra.ph/file/613f681a511feb6d1b186.jpg",
-    # ... other URLs
+    # Add more URLs if needed
 ]
 IMAGE_THUMBNAIL = random.choice(ROCKSPHOTO)
 
 def convert_seconds(seconds):
+    if not seconds:
+        return "Unknown"
     hours = seconds // 3600
     seconds %= 3600
     minutes = seconds // 60
@@ -35,62 +42,65 @@ def convert_seconds(seconds):
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
 
-# Ported download_song from youtube.py
-async def download_song(link: str):
+# Download song via API
+async def download_song(link: str, timeout: int = 10, max_retries: int = 5):
     video_id = link.split("v=")[-1].split("&")[0]
     download_folder = "downloads"
     os.makedirs(download_folder, exist_ok=True)
     
-    # Check if file already exists
     for ext in ["mp3", "m4a", "webm"]:
-        file_path = f"{download_folder}/{video_id}.{ext}"
+        file_path = os.path.join(download_folder, f"{video_id}.{ext}")
         if os.path.exists(file_path):
             return file_path
 
     song_url = f"{API_URL}/song/{video_id}?api={API_KEY}"
+    retries = 0
+    
     async with aiohttp.ClientSession() as session:
-        while True:
+        while retries < max_retries:
             try:
-                async with session.get(song_url) as response:
+                async with session.get(song_url, timeout=timeout) as response:
                     if response.status != 200:
-                        raise Exception(f"API request failed with status code {response.status}")
+                        raise Exception(f"API request failed with status {response.status}")
                     data = await response.json()
                     status = data.get("status", "").lower()
                     if status == "downloading":
                         await asyncio.sleep(2)
+                        retries += 1
                         continue
                     elif status == "error":
-                        error_msg = data.get("error") or data.get("message") or "Unknown error"
+                        error_msg = data.get("error", "Unknown error")
                         raise Exception(f"API error: {error_msg}")
                     elif status == "done":
                         download_url = data.get("link")
                         if not download_url:
-                            raise Exception("API response did not provide a download URL.")
+                            raise Exception("No download URL provided")
                         break
                     else:
-                        raise Exception(f"Unexpected status '{status}' from API.")
-            except Exception as e:
-                print(f"Error while checking API status: {e}")
-                return None
+                        raise Exception(f"Unexpected status: {status}")
+            except (aiohttp.ClientError, Exception) as e:
+                logging.error(f"Error checking API status: {e}")
+                retries += 1
+                await asyncio.sleep(2)
+                continue
+        
+        if retries >= max_retries:
+            logging.error("Max retries exceeded")
+            return None
 
         try:
-            file_format = data.get("format", "mp3")
-            file_extension = file_format.lower()
-            file_name = f"{video_id}.{file_extension}"
-            file_path = os.path.join(download_folder, file_name)
-
-            async with session.get(download_url) as file_response:
+            file_format = data.get("format", "mp3").lower()
+            file_path = os.path.join(download_folder, f"{video_id}.{file_format}")
+            async with session.get(download_url, timeout=timeout * 2) as file_response:
+                if file_response.status != 200:
+                    raise Exception(f"File download failed with status {file_response.status}")
                 with open(file_path, "wb") as f:
-                    while True:
-                        chunk = await file_response.content.read(8192)
-                        if not chunk:
-                            break
+                    async for chunk in file_response.content.iter_chunked(8192):
                         f.write(chunk)
                 return file_path
-        except Exception as e:
-            print(f"Error occurred while downloading song: {e}")
+        except (aiohttp.ClientError, OSError, Exception) as e:
+            logging.error(f"Download error: {e}")
             return None
-    return None
 
 def ytsearch(query):
     try:
@@ -99,13 +109,12 @@ def ytsearch(query):
             ytid = r["id"]
             songname = r["title"][:35] + "..." if len(r["title"]) > 34 else r["title"]
             url = f"https://www.youtube.com/watch?v={ytid}"
-            duration = r["duration"]
+            duration = r.get("duration", "Unknown")
         return [songname, url, duration]
     except Exception as e:
-        print(e)
+        logging.error(f"Search error: {e}")
         return 0
 
-# Modified ytdl to use download_song for audio
 async def ytdl(link, stream_type="audio"):
     if stream_type == "audio":
         file_path = await download_song(link)
@@ -113,7 +122,6 @@ async def ytdl(link, stream_type="audio"):
             return 1, file_path
         return 0, "Failed to download audio via API"
     else:
-        # Keep original yt-dlp for video
         proc = await asyncio.create_subprocess_exec(
             "yt-dlp",
             "-g",
@@ -235,41 +243,64 @@ async def videoplay(client, m: Message):
         if replied.video or replied.document:
             await m.delete()
             huehue = await replied.reply("**✧ Processing Videos...**")
-            dl = await replied.download()
-            link = replied.link
-            Q = 720 if len(m.command) < 2 else int(m.text.split(None, 1)[1]) if m.text.split(None, 1)[1] in ["720", "480", "360"] else 720
-            songname = replied.video.file_name[:70] if replied.video else replied.document.file_name[:70] if replied.document else "Video File"
-
-            if chat_id in QUEUE:
-                pos = add_to_queue(chat_id, songname, dl, link, "Video", Q)
-                await huehue.delete()
-                await m.reply_photo(
-                    photo=IMAGE_THUMBNAIL,
-                    caption=f"""
+            try:
+                dl = await replied.download()
+                if not dl:
+                    await huehue.edit("**Error: Failed to download video**")
+                    return
+                link = replied.link
+                try:
+                    Q = 720 if len(m.command) < 2 else int(m.text.split(None, 1)[1]) if m.text.split(None, 1)[1] in ["720", "480", "360"] else 720
+                except ValueError:
+                    Q = 720
+                    await huehue.edit("**Invalid quality! Using 720p.**")
+                try:
+                    songname = replied.video.file_name[:70] if replied.video else replied.document.file_name[:70] if replied.document else None
+                    if not songname:
+                        songname = "Video File"
+                except (AttributeError, TypeError):
+                    songname = "Video File"
+                duration = convert_seconds(replied.video.duration if replied.video and replied.video.duration else None)
+                
+                if chat_id in QUEUE:
+                    pos = add_to_queue(chat_id, songname, dl, link, "Video", Q)
+                    await huehue.delete()
+                    await m.reply_photo(
+                        photo=IMAGE_THUMBNAIL,
+                        caption=f"""
 **▶ Queued at** `{pos}`
 🏷 **Title:** [{songname}]({link})
+⏱ **Duration:** `{duration}`
 💡 **Status:** `Playing`
 🎧 **Requested by:** {m.from_user.mention}
 """,
-                )
-            else:
-                hmmm = HighQualityVideo() if Q == 720 else MediumQualityVideo() if Q == 480 else LowQualityVideo()
-                await call_py.join_group_call(
-                    chat_id,
-                    AudioVideoPiped(dl, HighQualityAudio(), hmmm),
-                    stream_type=StreamType().pulse_stream,
-                )
-                add_to_queue(chat_id, songname, dl, link, "Video", Q)
-                await huehue.delete()
-                await m.reply_photo(
-                    photo=IMAGE_THUMBNAIL,
-                    caption=f"""
+                    )
+                else:
+                    hmmm = HighQualityVideo() if Q == 720 else MediumQualityVideo() if Q == 480 else LowQualityVideo()
+                    await call_py.join_group_call(
+                        chat_id,
+                        AudioVideoPiped(dl, HighQualityAudio(), hmmm),
+                        stream_type=StreamType().pulse_stream,
+                    )
+                    add_to_queue(chat_id, songname, dl, link, "Video", Q)
+                    await huehue.delete()
+                    await m.reply_photo(
+                        photo=IMAGE_THUMBNAIL,
+                        caption=f"""
 **▶ Started Playing Video**
 🏷 **Title:** [{songname}]({link})
+⏱ **Duration:** `{duration}`
 💡 **Status:** `Playing`
 🎧 **Requested by:** {m.from_user.mention}
 """,
-                )
+                    )
+            except Exception as e:
+                logging.error(f"Video playback error: {e}")
+                await huehue.edit(f"**Error processing video:** `{e}`")
+                return
+        else:
+            await m.reply("**Please reply to a video or document**")
+            return
     else:
         if len(m.command) < 2:
             await m.reply("**Reply to a video file or provide a search query**")
@@ -331,7 +362,7 @@ async def playfrom(client, m: Message):
     else:
         args = m.text.split(maxsplit=1)[1]
         chat, limit = (args.split(";")[0], int(args.split(";")[1])) if ";" in args else (args, 10)
-        limit = min(limit, 10)  # Cap limit to avoid overload
+        limit = min(limit, 10)
         await m.delete()
         huehue = await m.reply(f"**✧ Fetching {limit} songs from {chat}...**")
         try:
@@ -360,6 +391,7 @@ async def playfrom(client, m: Message):
             await huehue.delete()
             await m.reply(f"**Added {limit} songs to queue**\n**Use `{HNDLR}playlist` to view**")
         except Exception as e:
+            logging.error(f"Playfrom error: {e}")
             await huehue.edit(f"**Error:** `{e}`")
 
 @Client.on_message(filters.command(["playlist", "queue"], prefixes=f"{HNDLR}"))
